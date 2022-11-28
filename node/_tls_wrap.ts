@@ -10,7 +10,12 @@ import assert from "./internal/assert.mjs";
 import * as net from "./net.ts";
 import { createSecureContext } from "./_tls_common.ts";
 import { kStreamBaseField } from "./internal_binding/stream_wrap.ts";
-import { connResetException } from "./internal/errors.ts";
+import {
+  connResetException,
+  ERR_OUT_OF_RANGE,
+  ERR_TLS_CERT_ALTNAME_FORMAT,
+ERR_TLS_CERT_ALTNAME_INVALID,
+} from "./internal/errors.ts";
 import { emitWarning } from "./process.ts";
 import { debuglog } from "./internal/util/debuglog.ts";
 import { constants as TCPConstants, TCP } from "./internal_binding/tcp_wrap.ts";
@@ -20,7 +25,7 @@ import {
 } from "./internal_binding/pipe_wrap.ts";
 import { EventEmitter } from "./events.ts";
 import { kEmptyObject } from "./internal/util.mjs";
-
+import { Buffer } from "./buffer.ts";
 const kConnectOptions = Symbol("connect-options");
 const kIsVerified = Symbol("verified");
 const kPendingSession = Symbol("pendingSession");
@@ -382,14 +387,245 @@ function getAllowUnauthorized() {
   return false;
 }
 
-// TODO(kt3k): Implement this when Deno provides APIs for getting peer
-// certificates.
-export function checkServerIdentity(_hostname: string, _cert: any) {
+function convertProtocols(protocols: any[]) {
+  const lens = new Array(protocols.length);
+  const buff = Buffer.allocUnsafe(
+    protocols.reduce((p: any, c: any, i: number) => {
+      const len = Buffer.byteLength(c);
+      if (len > 255) {
+        throw new ERR_OUT_OF_RANGE(
+          "The byte length of the protocol at index " +
+            `${i} exceeds the maximum length.`,
+          "<= 255",
+          len,
+          true,
+        );
+      }
+      lens[i] = len;
+      return p + 1 + len;
+    }),
+  );
+
+  let offset = 0;
+  for (let i = 0, c = protocols.length; i < c; i++) {
+    buff[offset++] = lens[i];
+    buff.write(protocols[i], offset);
+    offset += lens[i];
+  }
+  return buff;
+}
+
+export function convertALPNProtocols(protocols: any, out: any) {
+  // If protocols is Array - translate it into buffer
+  if (Array.isArray(protocols)) {
+    out.ALPNProtocols = convertProtocols(protocols);
+  } else if (protocols instanceof Uint8Array) {
+    // Copy new buffer not to be modified by user.
+    out.ALPNProtocols = Buffer.from(protocols);
+  } else if (ArrayBuffer.isView(protocols)) {
+    out.ALPNProtocols = Buffer.from(protocols.buffer.slice(
+      protocols.byteOffset,
+      protocols.byteOffset + protocols.byteLength,
+    ));
+  }
 }
 
 function unfqdn(host: string): string {
   return StringPrototypeReplace(host, /[.]$/, "");
 }
+// String#toLowerCase() is locale-sensitive so we use
+// a conservative version that only lowercases A-Z.
+function toLowerCase(c: string) {
+  return String.fromCharCode(32 + c.charCodeAt(0));
+}
+
+function splitHost(host: string) {
+  return unfqdn(host).replace(/[A-Z]/g, toLowerCase).split(".");
+}
+
+function check(hostParts: string[], pattern?: string, wildcards?: any) {
+  // Empty strings, null, undefined, etc. never match.
+  if (!pattern) {
+    return false;
+  }
+
+  const patternParts = splitHost(pattern);
+
+  if (hostParts.length !== patternParts.length) {
+    return false;
+  }
+
+  // Pattern has empty components, e.g. "bad..example.com".
+  if (patternParts.includes("")) {
+    return false;
+  }
+
+  // RFC 6125 allows IDNA U-labels (Unicode) in names but we have no
+  // good way to detect their encoding or normalize them so we simply
+  // reject them.  Control characters and blanks are rejected as well
+  // because nothing good can come from accepting them.
+  const isBad = (s: string) => /[^\u0021-\u007F]/u.exec(s) !== null;
+  if (patternParts.some(isBad)) {
+    return false;
+  }
+
+  // Check host parts from right to left first.
+  for (let i = hostParts.length - 1; i > 0; i -= 1) {
+    if (hostParts[i] !== patternParts[i]) {
+      return false;
+    }
+  }
+
+  const hostSubdomain = hostParts[0];
+  const patternSubdomain = patternParts[0];
+  const patternSubdomainParts = patternSubdomain.split("*");
+
+  // Short-circuit when the subdomain does not contain a wildcard.
+  // RFC 6125 does not allow wildcard substitution for components
+  // containing IDNA A-labels (Punycode) so match those verbatim.
+  if (
+    patternSubdomainParts.length === 1 ||
+    patternSubdomain.includes("xn--")
+  ) {
+    return hostSubdomain === patternSubdomain;
+  }
+
+  if (!wildcards) {
+    return false;
+  }
+
+  // More than one wildcard is always wrong.
+  if (patternSubdomainParts.length > 2) {
+    return false;
+  }
+
+  // *.tld wildcards are not allowed.
+  if (patternParts.length <= 2) {
+    return false;
+  }
+
+  const { 0: prefix, 1: suffix } = patternSubdomainParts;
+
+  if (prefix.length + suffix.length > hostSubdomain.length) {
+    return false;
+  }
+
+  if (!hostSubdomain.startsWith(prefix)) {
+    return false;
+  }
+
+  if (!hostSubdomain.endsWith(suffix)) {
+    return false;
+  }
+
+  return true;
+}
+
+// This pattern is used to determine the length of escaped sequences within
+// the subject alt names string. It allows any valid JSON string literal.
+// This MUST match the JSON specification (ECMA-404 / RFC8259) exactly.
+const jsonStringPattern =
+  // deno-lint-ignore no-control-regex
+  /^"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"/;
+
+function splitEscapedAltNames(altNames: string) {
+  const result: string[] = [];
+  let currentToken = "";
+  let offset = 0;
+  while (offset !== altNames.length) {
+    const nextSep = altNames.indexOf(", ", offset);
+    const nextQuote = altNames.indexOf('"', offset);
+    if (nextQuote !== -1 && (nextSep === -1 || nextQuote < nextSep)) {
+      // There is a quote character and there is no separator before the quote.
+      currentToken += altNames.substring(offset, nextQuote);
+      const match = jsonStringPattern.exec(altNames.substring(nextQuote));
+      if (!match) {
+        throw new ERR_TLS_CERT_ALTNAME_FORMAT();
+      }
+      currentToken += JSON.parse(match[0]);
+      offset = nextQuote + match[0].length;
+    } else if (nextSep !== -1) {
+      // There is a separator and no quote before it.
+      currentToken += altNames.substring(offset, nextSep);
+      result.push(currentToken);
+      currentToken = "";
+      offset = nextSep + 2;
+    } else {
+      currentToken += altNames.substring(offset);
+      offset = altNames.length;
+    }
+  }
+  result.push(currentToken);
+  return result;
+}
+
+export function checkServerIdentity(hostname: string, cert: any) {
+  const subject = cert.subject;
+  const altNames: string = cert.subjectaltname;
+  const dnsNames: string[] = [];
+  const ips: string[] = [];
+
+  hostname = "" + hostname;
+
+  if (altNames) {
+    const splitAltNames = altNames.includes('"')
+      ? splitEscapedAltNames(altNames)
+      : altNames.split(", ");
+    splitAltNames.forEach((name: string) => {
+      if (name.startsWith("DNS:")) {
+        dnsNames.push(name.slice(4));
+      } else if (name.startsWith("IP Address:")) {
+        ips.push(canonicalizeIP(name.slice(11)));
+      }
+    });
+  }
+
+  let valid = false;
+  let reason = "Unknown reason";
+
+  hostname = unfqdn(hostname); // Remove trailing dot for error messages.
+
+  if (net.isIP(hostname)) {
+    valid = ips.includes(canonicalizeIP(hostname));
+    if (!valid) {
+      reason = `IP: ${hostname} is not in the cert's list: ` +
+        ips.join(", ");
+    }
+  } else if (dnsNames.length > 0 || subject?.CN) {
+    const hostParts = splitHost(hostname);
+    const wildcard = (pattern: string) => check(hostParts, pattern, true);
+
+    if (dnsNames.length > 0) {
+      valid = dnsNames.some(wildcard);
+      if (!valid) {
+        reason =
+          `Host: ${hostname}. is not in the cert's altnames: ${altNames}`;
+      }
+    } else {
+      // Match against Common Name only if no supported identifiers exist.
+      const cn = subject.CN;
+
+      if (cn.isArray()) {
+        valid = cn.some(wildcard);
+      } else if (cn) {
+        valid = wildcard(cn);
+      }
+
+      if (!valid) {
+        reason = `Host: ${hostname}. is not cert's CN: ${cn}`;
+      }
+    }
+  } else {
+    reason = "Cert does not contain a DNS name";
+  }
+
+  if (!valid) {
+    return new ERR_TLS_CERT_ALTNAME_INVALID(reason, hostname, cert);
+  }
+}
+
+export const CLIENT_RENEG_LIMIT = 3;
+export const CLIENT_RENEG_WINDOW = 600;
 
 // Order matters. Mirrors ALL_CIPHER_SUITES from rustls/src/suites.rs but
 // using openssl cipher names instead. Mutable in Node but not (yet) in Deno.
@@ -412,6 +648,9 @@ export default {
   connect,
   createServer,
   checkServerIdentity,
+  CLIENT_RENEG_LIMIT,
+  CLIENT_RENEG_WINDOW,
   DEFAULT_CIPHERS,
+  convertALPNProtocols,
   unfqdn,
 };

@@ -1931,6 +1931,11 @@ export class ERR_SYNTHETIC extends NodeError {
     super("ERR_SYNTHETIC", `JavaScript Callstack`);
   }
 }
+export class ERR_TLS_CERT_ALTNAME_FORMAT extends NodeError {
+  constructor() {
+    super("ERR_TLS_CERT_ALTNAME_FORMAT", "Invalid subject alternative name string");
+  }
+}
 export class ERR_TLS_CERT_ALTNAME_INVALID extends NodeError {
   reason: string;
   host: string;
@@ -2238,6 +2243,7 @@ export class ERR_FALSY_VALUE_REJECTION extends NodeError {
     this.reason = reason;
   }
 }
+
 export class ERR_HTTP2_INVALID_SETTING_VALUE extends NodeRangeError {
   actual: unknown;
   min?: number;

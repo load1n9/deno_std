@@ -4,7 +4,6 @@
 import { notImplemented } from "./_utils.ts";
 import _tls_common from "./_tls_common.ts";
 import _tls_wrap from "./_tls_wrap.ts";
-
 // openssl -> rustls
 const cipherMap = {
   "__proto__": null,
@@ -28,6 +27,7 @@ export function getCiphers() {
 }
 
 export const rootCertificates = undefined;
+
 export const DEFAULT_ECDH_CURVE = "auto";
 export const DEFAULT_MAX_VERSION = "TLSv1.3";
 export const DEFAULT_MIN_VERSION = "TLSv1.2";
